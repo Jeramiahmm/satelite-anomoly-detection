@@ -237,6 +237,52 @@ services:
       timeout: 5s
       retries: 3
 
+  # --------------------------------------------------------------------------
+  # Prometheus — Metrics Collection (scrapes /metrics from each satellite)
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: astraea-prometheus
+    ports:
+      - "9091:9091"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.listen-address=:9091"
+      - "--storage.tsdb.retention.time=1h"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.20
+    depends_on:
+      - sat-01
+      - sat-02
+      - sat-03
+      - sat-04
+      - sat-05
+
+  # --------------------------------------------------------------------------
+  # Grafana — Live Dashboard UI (http://localhost:3000, admin/astraea)
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: astraea-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: astraea
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/astraea-constellation.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.21
+    depends_on:
+      - prometheus
+
 # ============================================================================
 # Network: Bridge network simulating the constellation mesh
 # ============================================================================

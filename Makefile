@@ -58,12 +58,17 @@ red-team-bitflip:  ## Run bitflip attack only
 bootstrap-ca:  ## Generate shared CA and per-node certificates
 	$(PYTHON) -m scripts.bootstrap_ca
 
-docker-up: bootstrap-ca  ## Build and launch the 5-node constellation
+docker-up: bootstrap-ca  ## Build and launch the 5-node constellation + Grafana
 	docker compose up --build -d
 	@echo ""
-	@echo "Constellation launched. Useful commands:"
+	@echo "Constellation launched!"
+	@echo ""
+	@echo "  Grafana dashboard:  http://localhost:3000  (admin / astraea)"
+	@echo "  Prometheus:         http://localhost:9091"
+	@echo "  NATS monitoring:    http://localhost:8222"
+	@echo ""
 	@echo "  make docker-logs       — Follow all node logs"
-	@echo "  make dashboard         — Open the live dashboard"
+	@echo "  make dashboard         — Terminal dashboard"
 	@echo "  make docker-red-team   — Run red-team inside container"
 	@echo "  make docker-down       — Stop everything"
 

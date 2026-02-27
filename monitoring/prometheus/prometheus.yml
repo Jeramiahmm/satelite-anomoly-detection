@@ -1,0 +1,21 @@
+# Prometheus configuration for Astraea-1 constellation
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "astraea-constellation"
+    static_configs:
+      - targets:
+          - "astraea-sat-01:9090"
+          - "astraea-sat-02:9090"
+          - "astraea-sat-03:9090"
+          - "astraea-sat-04:9090"
+          - "astraea-sat-05:9090"
+        labels:
+          constellation: "astraea-1"
+
+  - job_name: "nats"
+    static_configs:
+      - targets:
+          - "astraea-nats:8222"

@@ -69,7 +69,11 @@ PDP revocation, CRL update, and routing isolation. No Docker required.
 # One command does everything: generates CA certs, builds images, starts containers
 make docker-up
 
-# Watch the live terminal dashboard
+# Open Grafana dashboard in your browser
+#   → http://localhost:3000  (login: admin / astraea)
+#   The Astraea-1 Constellation dashboard loads automatically.
+
+# Watch the live terminal dashboard (alternative to Grafana)
 make dashboard
 
 # Monitor raw logs
@@ -92,11 +96,13 @@ python -m scripts.bootstrap_ca
 docker compose up --build -d
 
 # Step 3: Monitor
+open http://localhost:3000           # Grafana dashboard (admin / astraea)
 docker compose logs -f
-curl http://localhost:8222/varz     # NATS monitoring
-curl http://localhost:9090/health   # Node health (JSON)
-curl http://localhost:9090/metrics  # Prometheus metrics
-curl http://localhost:9090/status   # Human-readable status
+curl http://localhost:8222/varz      # NATS monitoring
+curl http://localhost:9091/targets   # Prometheus scrape targets
+curl http://localhost:9090/health    # Node health (JSON)
+curl http://localhost:9090/metrics   # Prometheus metrics
+curl http://localhost:9090/status    # Human-readable status
 
 # Step 4: Attack!
 docker compose exec sat-03 python -m scripts.red_team --attack polarized
@@ -182,6 +188,12 @@ scripts/
 configs/
 └── constellation.json       # Constellation topology + security + ML params
 
+monitoring/
+├── prometheus/prometheus.yml           # Scrape config for all 5 nodes
+└── grafana/
+    ├── dashboards/astraea-constellation.json  # Pre-built Grafana dashboard
+    └── provisioning/                          # Auto-config datasource + dashboard
+
 satellite_node.py            # Entry point — Deliverable #3
 federated_aggregator.py      # Entry point — Deliverable #4
 docker-compose.yaml          # Constellation orchestration — Deliverable #2
@@ -208,7 +220,30 @@ make clean               # Remove generated artifacts
 
 ## Observability
 
-Each satellite node exposes three HTTP endpoints on port 9090:
+### Grafana Dashboard (UI)
+
+When running with Docker (`make docker-up`), a full Grafana dashboard is available
+at **http://localhost:3000** (login: `admin` / `astraea`).
+
+The pre-built dashboard includes 12 panels across 3 sections:
+
+**Constellation Overview** — node online/offline status, certificate TTL countdown,
+trust level indicators, total telemetry throughput, CRL revocation count
+
+**Anomaly Detection** — real-time anomaly score per node (with threshold lines
+at 0.4/0.6/0.8), VAE reconstruction error vs dynamic threshold
+
+**Trust & Security** — trust score timeseries per node, reachable peers in
+routing mesh (drops when nodes get isolated)
+
+**Operations** — node uptime, cumulative anomaly detections (stacked bar),
+telemetry ingest rate (samples/sec)
+
+All panels auto-refresh every 5 seconds.
+
+### Per-Node HTTP Endpoints
+
+Each satellite also exposes three endpoints on port 9090:
 
 | Endpoint | Format | Use |
 |---|---|---|
