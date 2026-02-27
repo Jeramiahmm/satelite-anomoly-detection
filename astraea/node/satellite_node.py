@@ -61,6 +61,8 @@ from ..messaging.isl import (
     TOPIC_FEDERATION_GLOBAL,
     TOPIC_LSA,
 )
+from ..observability import start_metrics_server
+from ..observability.logging import configure_logging
 from ..policy.pdp import PolicyConfig, PolicyDecisionPoint
 from ..routing.link_state import LinkStateRouter
 
@@ -85,14 +87,23 @@ class NodeConfig:
     training_batches_per_epoch: int = 10
     warmup_samples: int = 50
     enable_mtls: bool = True  # Enable mTLS on NATS ISL
+    metrics_port: int = 9090  # Prometheus metrics HTTP server port
     peers: List[str] = field(default_factory=list)
     peer_latencies: Dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> NodeConfig:
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables, with optional
+        constellation.json fallback for topology settings."""
+        # Try to load constellation.json for defaults
+        config_defaults = _load_constellation_config(
+            os.environ.get("ASTRAEA_NODE_ID", "sat-01")
+        )
+
         peers_str = os.environ.get("ASTRAEA_PEERS", "")
         peers = [p.strip() for p in peers_str.split(",") if p.strip()]
+        if not peers and config_defaults.get("peers"):
+            peers = config_defaults["peers"]
 
         latencies_str = os.environ.get("ASTRAEA_PEER_LATENCIES", "")
         latencies = {}
@@ -114,9 +125,32 @@ class NodeConfig:
             ),
             enable_mtls=os.environ.get("ASTRAEA_ENABLE_MTLS", "true").lower()
             in ("1", "true", "yes"),
+            metrics_port=int(os.environ.get("ASTRAEA_METRICS_PORT", "9090")),
             peers=peers,
             peer_latencies=latencies,
         )
+
+
+def _load_constellation_config(node_id: str) -> Dict:
+    """Load defaults from configs/constellation.json if available."""
+    defaults: Dict = {}
+    for path in [
+        Path("configs/constellation.json"),
+        Path("/app/configs/constellation.json"),
+    ]:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    cfg = json.load(f)
+                for node_cfg in cfg.get("topology", {}).get("nodes", []):
+                    if node_cfg.get("node_id") == node_id:
+                        defaults["peers"] = node_cfg.get("peers", [])
+                        defaults["role"] = node_cfg.get("role")
+                        break
+            except Exception:
+                pass
+            break
+    return defaults
 
 
 @dataclass
@@ -188,6 +222,10 @@ class SatelliteNode:
         # Peer certificate serial tracking for PDP
         self._peer_serials: Dict[str, int] = {}
 
+        # Observability — metrics server
+        self._metrics_server = None
+        self._metrics_collector = None
+
     async def boot(self) -> None:
         """Full node bootstrap sequence."""
         logger.info("=" * 60)
@@ -252,6 +290,15 @@ class SatelliteNode:
 
         self._boot_time = time.time()
         self._running = True
+
+        # Phase 6: Start Prometheus metrics + health HTTP server
+        try:
+            self._metrics_server, self._metrics_collector = start_metrics_server(
+                self, port=self.config.metrics_port
+            )
+        except Exception:
+            logger.warning("Failed to start metrics server on port %d", self.config.metrics_port)
+
         logger.info("Node %s ONLINE (mTLS=%s)", self.node_id, tls_ctx is not None)
 
     async def run(self) -> None:
@@ -277,6 +324,8 @@ class SatelliteNode:
         self._running = False
         for task in self._tasks:
             task.cancel()
+        if self._metrics_server:
+            self._metrics_server.shutdown()
         if self.isl:
             await self.isl.close()
         logger.info("Node %s OFFLINE", self.node_id)
@@ -655,11 +704,7 @@ class SatelliteNode:
 
 def main() -> None:
     """CLI entry point for running a satellite node."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
+    configure_logging()
 
     config = NodeConfig.from_env()
     logger.info("Loaded config for node %s", config.node_id)

@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json as json_module
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -380,6 +382,12 @@ def main() -> None:
         default=2.0,
         help="Detection-to-isolation SLA in seconds (default: 2.0)",
     )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Path to write JSON results file (e.g., results/polarized.json)",
+    )
 
     args = parser.parse_args()
 
@@ -398,6 +406,20 @@ def main() -> None:
     )
 
     results = exercise.run_attack()
+
+    # Export results to JSON file if requested
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        results["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Replace infinity with null for valid JSON
+        sanitized = {
+            k: (None if isinstance(v, float) and v == float("inf") else v)
+            for k, v in results.items()
+        }
+        output_path.write_text(json_module.dumps(sanitized, indent=2) + "\n")
+        logger.info("Results written to %s", output_path)
+
     sys.exit(0 if results["passed"] else 1)
 
 

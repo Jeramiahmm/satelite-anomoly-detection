@@ -33,61 +33,119 @@ constellations.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Each node integrates:
+Each node runs:
 - **VAE Inference Engine** — Variational Autoencoder for telemetry anomaly detection
-- **mTLS Identity** — Ephemeral ECDSA P-384 certs with SPIFFE IDs (300s TTL)
+- **mTLS Identity** — Ephemeral ECDSA P-384 certs with SPIFFE IDs (300s TTL, auto-rotated)
 - **Policy Decision Point** — Zero-Trust evaluation, certificate revocation
 - **Federated Trainer** — Local VAE training, weight delta exchange (never raw data)
 - **Link-State Router** — Dijkstra with trust-weighted edges
+- **Prometheus Metrics** — `/metrics`, `/health`, `/status` on port 9090
+
+---
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.10+
-- Docker & Docker Compose (for constellation simulation)
-
-### Run Tests (No Docker Required)
+### Option 1: Just Run It (No Docker, 30 seconds)
 
 ```bash
+# Install dependencies
 pip install torch cryptography numpy pytest
-python -m pytest tests/test_integration.py -v
+
+# Run the test suite (29 tests)
+make test
+# or: python -m pytest tests/test_integration.py -v
+
+# Run a red-team attack simulation
+make red-team-polarized
+# or: python -m scripts.red_team --attack polarized
 ```
 
-### Run Red-Team Attack Simulation (No Docker Required)
+That's it. This runs the full pipeline in-process: VAE training, anomaly detection,
+PDP revocation, CRL update, and routing isolation. No Docker required.
+
+### Option 2: Full Docker Constellation (5 nodes + NATS + traffic shaping)
 
 ```bash
-# Polarized Telemetry Injection (hardest to detect)
-python -m scripts.red_team --attack polarized
+# One command does everything: generates CA certs, builds images, starts containers
+make docker-up
 
-# Space-Jacking attack
-python -m scripts.red_team --attack spacejack
+# Watch the live terminal dashboard
+make dashboard
 
-# Bit-Flip attack (simulating SEU)
-python -m scripts.red_team --attack bitflip
-
-# Custom parameters
-python -m scripts.red_team --target sat-03 --attack polarized --intensity 0.8 --nodes 5 --sla 2.0
-```
-
-### Run Full Docker Constellation
-
-```bash
-# Build and launch 5-node swarm with NATS broker
-docker compose up --build -d
-
-# Monitor logs
-docker compose logs -f
+# Monitor raw logs
+make docker-logs
 
 # Run red-team attack inside a container
-docker compose exec sat-03 python -m scripts.red_team
-
-# Inspect NATS monitoring
-curl http://localhost:8222/varz
+make docker-red-team
 
 # Tear down
+make docker-down
+```
+
+Or without Make:
+
+```bash
+# Step 1: Generate shared CA + per-node certificates (REQUIRED before Docker)
+python -m scripts.bootstrap_ca
+
+# Step 2: Build and launch the constellation
+docker compose up --build -d
+
+# Step 3: Monitor
+docker compose logs -f
+curl http://localhost:8222/varz     # NATS monitoring
+curl http://localhost:9090/health   # Node health (JSON)
+curl http://localhost:9090/metrics  # Prometheus metrics
+curl http://localhost:9090/status   # Human-readable status
+
+# Step 4: Attack!
+docker compose exec sat-03 python -m scripts.red_team --attack polarized
+
+# Step 5: Tear down
 docker compose down
 ```
+
+### Option 3: Red-Team with JSON Export
+
+```bash
+# Run all three attacks and save results
+make red-team
+
+# Or individually with output:
+python -m scripts.red_team --attack polarized --output results/polarized.json
+python -m scripts.red_team --attack spacejack --output results/spacejack.json
+python -m scripts.red_team --attack bitflip   --output results/bitflip.json
+
+# Results are machine-readable JSON:
+cat results/polarized.json
+```
+
+---
+
+## What Happens During an Attack
+
+```
+Nominal Telemetry → VAE detects reconstruction error spike
+                  → Dynamic threshold exceeded (EMA + 3σ)
+                  → PDP sees anomaly_score > 0.8 for 2 consecutive ticks
+                  → Certificate REVOKED, serial added to CRL
+                  → CRL broadcast to all peers over mTLS/NATS
+                  → Routing engine sets trust=0, Dijkstra reroutes around node
+                  → All mTLS connections from revoked node rejected
+                  → Node fully isolated from constellation mesh
+```
+
+Detection-to-isolation time: **< 5ms** (SLA target: < 2s)
+
+## Attack Models
+
+| Attack | Real-World Analog | Detection Difficulty |
+|---|---|---|
+| `polarized` | Compromised sensor firmware slowly drifting readings | Hard — mimics orbital variation |
+| `spacejack` | Hostile ground station spoofing commands | Medium — large multi-channel deviation |
+| `bitflip` | Single Event Upset from cosmic radiation (SEU) | Easy — sudden spikes in readings |
+
+---
 
 ## Project Structure
 
@@ -109,25 +167,76 @@ astraea/
 │   └── isl.py               # NATS-backed Inter-Satellite Link bus
 ├── policy/
 │   └── pdp.py               # Policy Decision Point (NIST 800-207)
+├── observability/
+│   ├── __init__.py          # Prometheus metrics + HTTP health server
+│   └── logging.py           # Structured JSON/text logging
 └── node/
     └── satellite_node.py    # Core node runtime (all subsystems)
 
+scripts/
+├── bootstrap_ca.py          # Generate shared CA + node certs for Docker
+├── red_team.py              # Attack simulation (Deliverable #5)
+├── dashboard.py             # Live terminal dashboard for monitoring
+└── entrypoint.sh            # Docker entrypoint with tc traffic shaping
+
+configs/
+└── constellation.json       # Constellation topology + security + ML params
+
 satellite_node.py            # Entry point — Deliverable #3
 federated_aggregator.py      # Entry point — Deliverable #4
-scripts/red_team.py          # Attack simulation — Deliverable #5
 docker-compose.yaml          # Constellation orchestration — Deliverable #2
 docs/ARCHITECTURE.md         # UML diagrams — Deliverable #1
+Makefile                     # Common operations (make help for full list)
 ```
 
-## Key Deliverables
+## Available Make Commands
 
-| # | Deliverable | File | Description |
-|---|---|---|---|
-| 1 | UML Diagram | `docs/ARCHITECTURE.md` | Mermaid sequence diagram: telemetry → detection → isolation |
-| 2 | Docker Compose | `docker-compose.yaml` | 5-node swarm + NATS + traffic shaping (tc) |
-| 3 | Satellite Node | `satellite_node.py` | VAE engine + mTLS server + routing table |
-| 4 | Fed. Aggregator | `federated_aggregator.py` | Secure FedAvg with gradient clipping |
-| 5 | Red-Team Script | `scripts/red_team.py` | Polarized telemetry injection attack |
+```bash
+make help                # Show all commands
+make install             # Install Python dependencies
+make test                # Run 29-test integration suite
+make lint                # Syntax check all Python files
+make red-team            # Run all 3 attack simulations with JSON export
+make red-team-polarized  # Run polarized attack only
+make docker-up           # Bootstrap CA + build + launch constellation
+make docker-down         # Tear down constellation
+make docker-logs         # Follow all node logs
+make dashboard           # Open live terminal dashboard (Docker)
+make dashboard-local     # Open dashboard for local testing
+make clean               # Remove generated artifacts
+```
+
+## Observability
+
+Each satellite node exposes three HTTP endpoints on port 9090:
+
+| Endpoint | Format | Use |
+|---|---|---|
+| `GET /metrics` | Prometheus text | Scrape target for Prometheus/Grafana |
+| `GET /health` | JSON | Liveness/readiness probes (Docker, K8s) |
+| `GET /status` | Plain text | Human-readable node status |
+
+**Prometheus metrics exposed:**
+
+- `astraea_anomaly_score` — Current normalized anomaly score [0-1]
+- `astraea_anomaly_threshold` — Dynamic detection threshold
+- `astraea_trust_score` — Node trust score [0-1]
+- `astraea_trust_level` — Trust level (3=trusted, 0=revoked)
+- `astraea_cert_ttl_remaining_seconds` — Time until cert expiry
+- `astraea_telemetry_samples_total` — Total samples processed
+- `astraea_anomaly_detections_total` — Total anomaly detections
+- `astraea_crl_revoked_count` — Certificates in local CRL
+- `astraea_routing_reachable_peers` — Reachable peer count
+- `astraea_peer_trust_score{peer="sat-XX"}` — Per-peer trust
+
+### Structured JSON Logging
+
+Set `ASTRAEA_LOG_FORMAT=json` to switch all log output to single-line JSON
+for ingestion by log aggregators (ELK, Loki, CloudWatch):
+
+```bash
+ASTRAEA_LOG_FORMAT=json ASTRAEA_LOG_LEVEL=DEBUG python -m astraea.node
+```
 
 ## System Design Details
 
@@ -137,30 +246,60 @@ docs/ARCHITECTURE.md         # UML diagrams — Deliverable #1
 2. **VAE Reconstruction** — Forward pass computes `x_hat`, reconstruction error `L = ||x - x_hat||^2`
 3. **Dynamic Threshold** — EMA-based: `tau = mu_ema + 3*sigma_ema` (only updated on nominal samples)
 4. **Sigmoid Normalization** — Maps raw error to `[0, 1]` anomaly score
-5. **Policy Evaluation** — Score > 0.8 for 2 consecutive ticks → REVOKE
+5. **Policy Evaluation** — Score > 0.8 for 2 consecutive ticks -> REVOKE
 
 ### Zero-Trust Mesh Isolation
 
 When the PDP revokes a node:
 1. Certificate serial added to CRL (thread-safe, broadcast to all peers)
-2. Routing engine sets `trust_score = 0.0` → all edges to node become infinite
+2. Routing engine sets `trust_score = 0.0` -> all edges to node become infinite cost
 3. Dijkstra recomputation bypasses the node via multi-hop alternate paths
 4. mTLS connections from the revoked node are rejected by all peers
 
 ### Federated Learning
 
-- **Algorithm**: FedAvg with L2-norm gradient clipping
+- **Algorithm**: FedAvg with L2-norm gradient clipping (clip_norm=10.0)
 - **Privacy**: Only weight deltas (delta_w = w_local - w_global) are shared
 - **Security**: Revoked nodes are excluded from aggregation rounds
 - **Transport**: Serialized PyTorch state dicts over mTLS/NATS
 
+### Certificate Lifecycle
+
+- **Curve**: ECDSA P-384 (NIST Suite B compliant)
+- **TTL**: 300 seconds (aggressive rotation for zero-trust)
+- **Rotation**: Automatic at 80% TTL (60s before expiry)
+- **SPIFFE ID**: `spiffe://astraea-1.mesh/satellite/{node_id}`
+- **mTLS**: TLS 1.3 with mutual certificate verification
+
 ### Traffic Shaping (Docker)
 
 Each container uses `tc` (Traffic Control) with HTB + netem:
-- **Latency**: 200ms-800ms (variable per orbital position)
-- **Jitter**: 30ms-120ms (Gaussian distribution)
-- **Loss**: 0%-5% (Grey-Hole attack simulation on SAT-05)
-- **Bandwidth**: 512kbit-2mbit (ISL capacity constraints)
+
+| Node | Latency | Jitter | Loss | Bandwidth |
+|---|---|---|---|---|
+| SAT-01 | 200ms | 30ms | 0% | 2mbit |
+| SAT-02 | 350ms | 50ms | 1% | 1mbit |
+| SAT-03 | 400ms | 80ms | 2% | 1mbit |
+| SAT-04 | 600ms | 100ms | 3% | 512kbit |
+| SAT-05 | 800ms | 120ms | 5% | 512kbit |
+
+## Configuration
+
+All parameters are configurable via environment variables OR `configs/constellation.json`.
+Environment variables take precedence.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ASTRAEA_NODE_ID` | `sat-01` | Node identifier |
+| `ASTRAEA_NATS_URL` | `nats://nats-server:4222` | NATS broker URL |
+| `ASTRAEA_PEERS` | *(from config)* | Comma-separated peer node IDs |
+| `ASTRAEA_IS_AGGREGATOR` | `false` | Enable federation aggregator role |
+| `ASTRAEA_ENABLE_MTLS` | `true` | Enable mTLS on NATS connections |
+| `ASTRAEA_TELEMETRY_HZ` | `10` | Telemetry ingestion rate |
+| `ASTRAEA_FEDERATION_INTERVAL` | `30` | Seconds between federation rounds |
+| `ASTRAEA_METRICS_PORT` | `9090` | Prometheus metrics HTTP port |
+| `ASTRAEA_LOG_FORMAT` | `text` | Log format: `text` or `json` |
+| `ASTRAEA_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ## Test Results
 
@@ -176,10 +315,40 @@ Each container uses `tc` (Traffic Control) with HTB + netem:
 └── TestEndToEndPipeline (1 test)    — Full D→I path < 2s SLA
 ```
 
-Red-Team results (all PASS):
+## Troubleshooting
 
-| Attack | Detection | D-to-I Time | SLA Met |
-|---|---|---|---|
-| Spacejack | 0.8ms | 1.8ms | < 2.0s |
-| Polarized | 0.9ms | 2.2ms | < 2.0s |
-| Bitflip | 1.2ms | 3.5ms | < 2.0s |
+**Tests fail with `ModuleNotFoundError: No module named 'torch'`**
+```bash
+pip install torch cryptography numpy pytest
+```
+
+**Docker fails with "certificate not found"**
+```bash
+# You need to run the CA bootstrap BEFORE docker compose up:
+python -m scripts.bootstrap_ca
+docker compose up --build -d
+# Or just: make docker-up  (does both automatically)
+```
+
+**NATS connection refused**
+```bash
+# Check NATS is healthy:
+docker compose ps
+curl http://localhost:8222/varz
+```
+
+**Want to change the constellation topology?**
+Edit `configs/constellation.json` — it defines all node IDs, peers, orbital
+parameters, security settings, and ML hyperparameters.
+
+## CI/CD
+
+GitHub Actions runs on every push and pull request:
+- Syntax check across all Python files
+- Full 29-test integration suite (Python 3.10, 3.11, 3.12)
+- All three red-team attack simulations
+- Docker build verification
+
+## License
+
+MIT
