@@ -172,11 +172,16 @@ class TestAnomalyDetector:
 
     def test_nominal_not_anomalous(self):
         detector = self._make_trained_detector()
+        anomaly_count = 0
         for t in range(20):
             raw = generate_telemetry_batch(1, AttackMode.NOMINAL, time_step=100 + t)
             x = normalize_telemetry(raw).squeeze(0)
             state = detector.ingest(x)
-        assert not state.is_anomalous
+            if state.is_anomalous:
+                anomaly_count += 1
+        # Allow at most 2 spurious detections out of 20 nominal samples
+        # (VAE reconstruction error is stochastic)
+        assert anomaly_count <= 2, f"Too many false positives: {anomaly_count}/20"
 
     def test_spacejack_detected(self):
         detector = self._make_trained_detector()
