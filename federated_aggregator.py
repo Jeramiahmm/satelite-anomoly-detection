@@ -39,6 +39,7 @@ import torch
 
 from astraea.crypto.identity import (
     CertificateAuthority,
+    create_mtls_client_context,
     generate_ca,
     issue_node_certificate,
     persist_identity,
@@ -95,8 +96,14 @@ class AggregatorService:
             clip_norm=clip_norm,
         )
 
-        # Messaging
-        self.isl = ISLBus(node_id=node_id, nats_url=nats_url)
+        # Messaging — with mTLS
+        tls_ctx = None
+        try:
+            tls_ctx = create_mtls_client_context(self.identity)
+            logger.info("mTLS context created for aggregator ISL")
+        except Exception:
+            logger.warning("Failed to create mTLS context for aggregator")
+        self.isl = ISLBus(node_id=node_id, nats_url=nats_url, tls_context=tls_ctx)
 
         # State
         self._running = False

@@ -13,7 +13,7 @@ It integrates all subsystems into a single asyncio event loop:
 
 Lifecycle:
     boot() → identity_bootstrap() → [telemetry_loop | federation_loop |
-              routing_loop | security_loop] → shutdown()
+              routing_loop | cert_rotation_loop] → shutdown()
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 import torch
 
 from ..crypto.identity import (
+    CERT_TTL_SECONDS,
     CertificateAuthority,
     NodeIdentity,
     create_mtls_client_context,
@@ -40,6 +41,7 @@ from ..crypto.identity import (
     generate_ca,
     issue_node_certificate,
     persist_identity,
+    extract_spiffe_id,
 )
 from ..crypto.crl_manager import CRLCache
 from ..federation.aggregator import FederatedAggregator
@@ -64,6 +66,9 @@ from ..routing.link_state import LinkStateRouter
 
 logger = logging.getLogger(__name__)
 
+# Rotate certificates when 20% of TTL remains (60s before expiry at 300s TTL)
+CERT_ROTATION_MARGIN_RATIO = 0.2
+
 
 @dataclass
 class NodeConfig:
@@ -79,6 +84,7 @@ class NodeConfig:
     training_epochs_per_round: int = 5
     training_batches_per_epoch: int = 10
     warmup_samples: int = 50
+    enable_mtls: bool = True  # Enable mTLS on NATS ISL
     peers: List[str] = field(default_factory=list)
     peer_latencies: Dict[str, float] = field(default_factory=dict)
 
@@ -106,9 +112,26 @@ class NodeConfig:
             federation_interval_s=float(
                 os.environ.get("ASTRAEA_FEDERATION_INTERVAL", "30.0")
             ),
+            enable_mtls=os.environ.get("ASTRAEA_ENABLE_MTLS", "true").lower()
+            in ("1", "true", "yes"),
             peers=peers,
             peer_latencies=latencies,
         )
+
+
+@dataclass
+class HealthStatus:
+    """Node health report for liveness/readiness probes."""
+
+    node_id: str = ""
+    online: bool = False
+    uptime_s: float = 0.0
+    cert_expires_in_s: float = 0.0
+    anomaly_score: float = 0.0
+    trust_level: str = "unknown"
+    peers_reachable: int = 0
+    federation_rounds: int = 0
+    telemetry_ticks: int = 0
 
 
 class SatelliteNode:
@@ -142,7 +165,7 @@ class SatelliteNode:
         # Routing
         self.router = LinkStateRouter(self.node_id)
 
-        # Policy
+        # Policy — register callbacks
         self.pdp = PolicyDecisionPoint(
             config=PolicyConfig(),
             on_revoke=self._handle_revocation,
@@ -150,18 +173,20 @@ class SatelliteNode:
             on_trust_change=self._handle_trust_change,
         )
 
-        # Messaging
-        self.isl = ISLBus(
-            node_id=self.node_id,
-            nats_url=config.nats_url,
-        )
+        # Messaging — will be initialized with mTLS in boot()
+        self.isl: Optional[ISLBus] = None
 
         # Runtime state
         self._running = False
         self._time_step = 0
+        self._boot_time = 0.0
+        self._cert_issued_at = 0.0
         self._attack_mode = AttackMode.NOMINAL
         self._attack_intensity = 0.0
         self._tasks: List[asyncio.Task] = []
+
+        # Peer certificate serial tracking for PDP
+        self._peer_serials: Dict[str, int] = {}
 
     async def boot(self) -> None:
         """Full node bootstrap sequence."""
@@ -169,20 +194,18 @@ class SatelliteNode:
         logger.info("ASTRAEA-1 NODE BOOT: %s", self.node_id)
         logger.info("=" * 60)
 
-        # Phase 1: Identity Bootstrap
-        self.identity = issue_node_certificate(self.ca, self.node_id)
-        cert_dir = Path(self.config.cert_dir) / self.node_id
-        persist_identity(self.identity, cert_dir)
-        logger.info(
-            "Identity: %s  serial=%d",
-            self.identity.spiffe_id,
-            self.identity.certificate.serial_number,
-        )
+        # Phase 1: Identity Bootstrap — issue ephemeral certificate
+        self._issue_certificate()
 
-        # Register with PDP
+        # Register self with PDP
         self.pdp.register_node(
             self.node_id, self.identity.certificate.serial_number
         )
+
+        # Pre-register known peers with PDP (serial=0 as placeholder until
+        # we receive their actual cert serial via LSA/alert)
+        for peer in self.config.peers:
+            self.pdp.register_node(peer, cert_serial=0)
 
         # Phase 2: Initialize routing topology
         for peer in self.config.peers:
@@ -210,12 +233,26 @@ class SatelliteNode:
             self.detector.state.threshold,
         )
 
-        # Phase 5: Connect ISL bus
+        # Phase 5: Initialize ISL bus with mTLS context
+        tls_ctx = None
+        if self.config.enable_mtls and self.identity is not None:
+            try:
+                tls_ctx = create_mtls_client_context(self.identity)
+                logger.info("mTLS context created for ISL bus")
+            except Exception:
+                logger.warning("Failed to create mTLS context — ISL will run without TLS")
+
+        self.isl = ISLBus(
+            node_id=self.node_id,
+            nats_url=self.config.nats_url,
+            tls_context=tls_ctx,
+        )
         await self.isl.connect()
         await self._setup_subscriptions()
 
+        self._boot_time = time.time()
         self._running = True
-        logger.info("Node %s ONLINE", self.node_id)
+        logger.info("Node %s ONLINE (mTLS=%s)", self.node_id, tls_ctx is not None)
 
     async def run(self) -> None:
         """Start all concurrent event loops."""
@@ -225,9 +262,9 @@ class SatelliteNode:
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._federation_loop()),
             asyncio.create_task(self._routing_loop()),
+            asyncio.create_task(self._cert_rotation_loop()),
         ]
 
-        # Wait until shutdown signal
         try:
             await asyncio.gather(*self._tasks)
         except asyncio.CancelledError:
@@ -240,8 +277,72 @@ class SatelliteNode:
         self._running = False
         for task in self._tasks:
             task.cancel()
-        await self.isl.close()
+        if self.isl:
+            await self.isl.close()
         logger.info("Node %s OFFLINE", self.node_id)
+
+    # ------------------------------------------------------------------
+    # Certificate Management
+    # ------------------------------------------------------------------
+
+    def _issue_certificate(self) -> None:
+        """Issue (or re-issue) an ephemeral X.509 certificate."""
+        self.identity = issue_node_certificate(self.ca, self.node_id)
+        cert_dir = Path(self.config.cert_dir) / self.node_id
+        persist_identity(self.identity, cert_dir)
+        self._cert_issued_at = time.time()
+        logger.info(
+            "Identity: %s  serial=%d  ttl=%ds",
+            self.identity.spiffe_id,
+            self.identity.certificate.serial_number,
+            CERT_TTL_SECONDS,
+        )
+
+    async def _cert_rotation_loop(self) -> None:
+        """
+        Periodically rotate the ephemeral certificate before TTL expiry.
+
+        Rotation happens when the remaining lifetime drops below
+        CERT_ROTATION_MARGIN_RATIO * CERT_TTL_SECONDS (default: 60s).
+        """
+        margin = CERT_TTL_SECONDS * CERT_ROTATION_MARGIN_RATIO
+        check_interval = max(margin / 2, 10.0)
+        logger.info(
+            "Cert rotation loop started (ttl=%ds  margin=%.0fs  check=%.0fs)",
+            CERT_TTL_SECONDS,
+            margin,
+            check_interval,
+        )
+
+        while self._running:
+            await asyncio.sleep(check_interval)
+            if not self._running:
+                break
+
+            elapsed = time.time() - self._cert_issued_at
+            remaining = CERT_TTL_SECONDS - elapsed
+
+            if remaining <= margin:
+                logger.info(
+                    "Certificate rotation: %.0fs remaining (margin=%.0fs) — re-issuing",
+                    remaining,
+                    margin,
+                )
+                old_serial = self.identity.certificate.serial_number
+                self._issue_certificate()
+
+                # Update mTLS context on ISL if enabled
+                if self.config.enable_mtls and self.isl is not None:
+                    try:
+                        new_ctx = create_mtls_client_context(self.identity)
+                        self.isl.tls_context = new_ctx
+                        logger.info(
+                            "mTLS context rotated: old_serial=%d  new_serial=%d",
+                            old_serial,
+                            self.identity.certificate.serial_number,
+                        )
+                    except Exception:
+                        logger.warning("Failed to rotate mTLS context")
 
     # ------------------------------------------------------------------
     # Core Event Loops
@@ -273,10 +374,10 @@ class SatelliteNode:
             self.pdp.evaluate(self.node_id, state.last_normalized_score)
 
             if state.is_anomalous and self._time_step % 10 == 0:
-                # Broadcast alert to peers
                 alert = {
                     "type": "anomaly_alert",
                     "node_id": self.node_id,
+                    "cert_serial": self.identity.certificate.serial_number,
                     "anomaly_score": state.last_normalized_score,
                     "raw_score": state.last_score,
                     "threshold": state.threshold,
@@ -299,7 +400,6 @@ class SatelliteNode:
             if not self._running:
                 break
 
-            # Local training
             for _ in range(self.config.training_epochs_per_round):
                 self.trainer.train_epoch(
                     batch_size=64,
@@ -307,10 +407,8 @@ class SatelliteNode:
                     time_step=self._time_step,
                 )
 
-            # Compute and publish weight delta
             delta = self.trainer.compute_weight_delta()
 
-            # Serialize delta for ISL transmission
             buf = io.BytesIO()
             torch.save(
                 {"node_id": self.node_id, "delta": delta},
@@ -318,7 +416,6 @@ class SatelliteNode:
             )
             await self.isl.publish(TOPIC_FEDERATION_DELTAS, buf.getvalue())
 
-            # If we're the aggregator, process locally too
             if self.aggregator:
                 self.aggregator.submit_delta(
                     self.node_id,
@@ -340,6 +437,9 @@ class SatelliteNode:
                 break
 
             lsa = self.router.generate_lsa()
+            # Include our cert serial so peers can register us in their PDP
+            lsa["cert_serial"] = self.identity.certificate.serial_number
+            lsa["spiffe_id"] = self.identity.spiffe_id
             await self.isl.publish_json(TOPIC_LSA, lsa)
 
     # ------------------------------------------------------------------
@@ -373,8 +473,37 @@ class SatelliteNode:
         """Handle Link-State Advertisement from a peer."""
         try:
             lsa = json.loads(msg.data.decode())
-            if lsa.get("origin") != self.node_id:
-                self.router.apply_lsa(lsa)
+            origin = lsa.get("origin")
+            if origin == self.node_id:
+                return
+
+            # Register peer's certificate serial with PDP if we haven't yet
+            cert_serial = lsa.get("cert_serial")
+            if origin and cert_serial and origin not in self._peer_serials:
+                self._peer_serials[origin] = cert_serial
+                # Update PDP registration with actual serial
+                pdp_state = self.pdp.get_node_state(origin)
+                if pdp_state is not None and pdp_state.cert_serial == 0:
+                    pdp_state.cert_serial = cert_serial
+                    logger.info(
+                        "Registered peer cert: node=%s  serial=%d",
+                        origin,
+                        cert_serial,
+                    )
+                elif pdp_state is None:
+                    self.pdp.register_node(origin, cert_serial)
+
+            # Validate peer SPIFFE ID format
+            spiffe_id = lsa.get("spiffe_id", "")
+            if spiffe_id and not spiffe_id.startswith("spiffe://astraea-1.mesh/"):
+                logger.warning(
+                    "Rejected LSA from %s: invalid SPIFFE ID %s",
+                    origin,
+                    spiffe_id,
+                )
+                return
+
+            self.router.apply_lsa(lsa)
         except Exception:
             logger.exception("Error processing LSA")
 
@@ -385,7 +514,19 @@ class SatelliteNode:
             source = alert.get("node_id", "unknown")
             if source == self.node_id:
                 return
+
             score = alert.get("anomaly_score", 0)
+
+            # Register peer cert serial if included in alert
+            cert_serial = alert.get("cert_serial")
+            if cert_serial and source not in self._peer_serials:
+                self._peer_serials[source] = cert_serial
+                pdp_state = self.pdp.get_node_state(source)
+                if pdp_state is not None and pdp_state.cert_serial == 0:
+                    pdp_state.cert_serial = cert_serial
+                elif pdp_state is None:
+                    self.pdp.register_node(source, cert_serial)
+
             self.pdp.evaluate(source, score)
             logger.warning(
                 "Peer anomaly alert: node=%s  score=%.4f", source, score
@@ -422,12 +563,10 @@ class SatelliteNode:
             )
 
             if accepted:
-                # Try to aggregate if enough participants
                 result = self.aggregator.aggregate(
                     excluded_nodes=set(self.pdp.get_revoked_nodes())
                 )
                 if result is not None:
-                    # Broadcast new global model
                     data = self.aggregator.serialize_global_state()
                     await self.isl.publish(TOPIC_FEDERATION_GLOBAL, data)
                     logger.info("Global model broadcast after aggregation")
@@ -446,9 +585,10 @@ class SatelliteNode:
         self.crl.add_revocation(cert_serial, source="pdp")
 
         # Broadcast CRL update to constellation
-        asyncio.ensure_future(
-            self.isl.publish(TOPIC_CRL_SYNC, self.crl.serialize())
-        )
+        if self.isl:
+            asyncio.ensure_future(
+                self.isl.publish(TOPIC_CRL_SYNC, self.crl.serialize())
+            )
 
     def _handle_isolation(self, node_id: str) -> None:
         """Callback: PDP requires mesh isolation of a node."""
@@ -458,6 +598,32 @@ class SatelliteNode:
     def _handle_trust_change(self, node_id: str, new_trust: float) -> None:
         """Callback: trust score changed — update routing weights."""
         self.router.update_trust_score(node_id, new_trust)
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+
+    def health(self) -> HealthStatus:
+        """Return current health status for liveness probes."""
+        cert_remaining = 0.0
+        if self._cert_issued_at > 0:
+            cert_remaining = max(
+                0.0, CERT_TTL_SECONDS - (time.time() - self._cert_issued_at)
+            )
+
+        pdp_state = self.pdp.get_node_state(self.node_id)
+
+        return HealthStatus(
+            node_id=self.node_id,
+            online=self._running,
+            uptime_s=time.time() - self._boot_time if self._boot_time else 0.0,
+            cert_expires_in_s=cert_remaining,
+            anomaly_score=self.detector.get_anomaly_score(),
+            trust_level=pdp_state.trust_level.value if pdp_state else "unknown",
+            peers_reachable=len(self.router.get_reachable_nodes()),
+            federation_rounds=self.aggregator.round_id if self.aggregator else 0,
+            telemetry_ticks=self._time_step,
+        )
 
     # ------------------------------------------------------------------
     # Attack Injection (for Red Team testing)

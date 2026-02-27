@@ -23,10 +23,8 @@ env/
 .coverage
 htmlcov/
 
-# Certificates (generated at runtime)
-certs/*.pem
-certs/*.key
-certs/*.crt
+# Certificates (generated at runtime by bootstrap_ca.py)
+certs/
 
 # PyTorch models
 *.pt

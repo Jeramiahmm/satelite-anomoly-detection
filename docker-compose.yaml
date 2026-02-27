@@ -2,38 +2,47 @@
 # Astraea-1 Protocol — Constellation Orchestration
 # ============================================================================
 # Simulates a 5-node LEO satellite swarm with:
-#   - NATS message broker for Inter-Satellite Links (ISL)
+#   - NATS message broker for Inter-Satellite Links (ISL) with TLS
 #   - Per-node traffic shaping for orbital dynamics simulation
+#   - Shared CA for mutual TLS across the constellation
 #   - Bridge network for mesh connectivity
 #
 # Topology:
-#   sat-01 ←→ sat-02 ←→ sat-03 ←→ sat-04 ←→ sat-05
-#     ↑                                          ↑
-#     └──────────────────────────────────────────┘
+#   sat-01 <-> sat-02 <-> sat-03 <-> sat-04 <-> sat-05
+#     ^                                            ^
+#     +--------------------------------------------+
 #
 #   sat-05 is the designated federation aggregator.
 #
 # Usage:
-#   docker compose up --build -d
-#   docker compose logs -f
+#   python -m scripts.bootstrap_ca       # Generate shared CA + node certs
+#   docker compose up --build -d          # Launch constellation
+#   docker compose logs -f                # Monitor
 #   docker compose exec sat-03 python -m scripts.red_team  # Attack!
 # ============================================================================
 
 services:
   # --------------------------------------------------------------------------
-  # NATS Server — Inter-Satellite Link Broker
+  # NATS Server — Inter-Satellite Link Broker (TLS-enabled)
   # --------------------------------------------------------------------------
   nats-server:
     image: nats:2.10-alpine
     container_name: astraea-nats
     ports:
-      - "4222:4222"    # Client connections
+      - "4222:4222"    # Client connections (TLS)
       - "8222:8222"    # HTTP monitoring
     command: >
       --name astraea-nats
       --http_port 8222
       --max_payload 4194304
       --write_deadline 10s
+      --tls
+      --tlscert /certs/nats-server/nats-server.crt
+      --tlskey /certs/nats-server/nats-server.key
+      --tlscacert /certs/nats-server/ca.crt
+      --tlsverify
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.10
@@ -58,18 +67,27 @@ services:
       ASTRAEA_PEERS: "sat-02,sat-05"
       ASTRAEA_PEER_LATENCIES: "sat-02:250,sat-05:600"
       ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_ENABLE_MTLS: "true"
       ASTRAEA_LATENCY_MS: "200"
       ASTRAEA_JITTER_MS: "30"
       ASTRAEA_LOSS_PERCENT: "0"
       ASTRAEA_BANDWIDTH: "2mbit"
       ASTRAEA_TELEMETRY_HZ: "10"
       ASTRAEA_FEDERATION_INTERVAL: "30"
+      ASTRAEA_CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.11
     depends_on:
       nats-server:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # --------------------------------------------------------------------------
   # SAT-02: Standard telemetry node (medium-latency link)
@@ -86,18 +104,27 @@ services:
       ASTRAEA_PEERS: "sat-01,sat-03"
       ASTRAEA_PEER_LATENCIES: "sat-01:250,sat-03:350"
       ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_ENABLE_MTLS: "true"
       ASTRAEA_LATENCY_MS: "350"
       ASTRAEA_JITTER_MS: "50"
       ASTRAEA_LOSS_PERCENT: "1"
       ASTRAEA_BANDWIDTH: "1mbit"
       ASTRAEA_TELEMETRY_HZ: "10"
       ASTRAEA_FEDERATION_INTERVAL: "30"
+      ASTRAEA_CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.12
     depends_on:
       nats-server:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # --------------------------------------------------------------------------
   # SAT-03: The "attack target" — will receive red-team injection
@@ -114,18 +141,27 @@ services:
       ASTRAEA_PEERS: "sat-02,sat-04"
       ASTRAEA_PEER_LATENCIES: "sat-02:350,sat-04:300"
       ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_ENABLE_MTLS: "true"
       ASTRAEA_LATENCY_MS: "400"
       ASTRAEA_JITTER_MS: "80"
       ASTRAEA_LOSS_PERCENT: "2"
       ASTRAEA_BANDWIDTH: "1mbit"
       ASTRAEA_TELEMETRY_HZ: "10"
       ASTRAEA_FEDERATION_INTERVAL: "30"
+      ASTRAEA_CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.13
     depends_on:
       nats-server:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # --------------------------------------------------------------------------
   # SAT-04: High-latency edge node (simulates far orbital plane)
@@ -142,18 +178,27 @@ services:
       ASTRAEA_PEERS: "sat-03,sat-05"
       ASTRAEA_PEER_LATENCIES: "sat-03:300,sat-05:400"
       ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_ENABLE_MTLS: "true"
       ASTRAEA_LATENCY_MS: "600"
       ASTRAEA_JITTER_MS: "100"
       ASTRAEA_LOSS_PERCENT: "3"
       ASTRAEA_BANDWIDTH: "512kbit"
       ASTRAEA_TELEMETRY_HZ: "10"
       ASTRAEA_FEDERATION_INTERVAL: "30"
+      ASTRAEA_CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.14
     depends_on:
       nats-server:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # --------------------------------------------------------------------------
   # SAT-05: Federation Aggregator + Grey-Hole Attack Simulation
@@ -170,18 +215,27 @@ services:
       ASTRAEA_PEERS: "sat-01,sat-04"
       ASTRAEA_PEER_LATENCIES: "sat-01:600,sat-04:400"
       ASTRAEA_IS_AGGREGATOR: "true"
+      ASTRAEA_ENABLE_MTLS: "true"
       ASTRAEA_LATENCY_MS: "800"
       ASTRAEA_JITTER_MS: "120"
       ASTRAEA_LOSS_PERCENT: "5"
       ASTRAEA_BANDWIDTH: "512kbit"
       ASTRAEA_TELEMETRY_HZ: "10"
       ASTRAEA_FEDERATION_INTERVAL: "30"
+      ASTRAEA_CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs:ro
     networks:
       constellation:
         ipv4_address: 172.28.0.15
     depends_on:
       nats-server:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 # ============================================================================
 # Network: Bridge network simulating the constellation mesh
