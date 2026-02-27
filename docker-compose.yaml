@@ -1,0 +1,195 @@
+# ============================================================================
+# Astraea-1 Protocol — Constellation Orchestration
+# ============================================================================
+# Simulates a 5-node LEO satellite swarm with:
+#   - NATS message broker for Inter-Satellite Links (ISL)
+#   - Per-node traffic shaping for orbital dynamics simulation
+#   - Bridge network for mesh connectivity
+#
+# Topology:
+#   sat-01 ←→ sat-02 ←→ sat-03 ←→ sat-04 ←→ sat-05
+#     ↑                                          ↑
+#     └──────────────────────────────────────────┘
+#
+#   sat-05 is the designated federation aggregator.
+#
+# Usage:
+#   docker compose up --build -d
+#   docker compose logs -f
+#   docker compose exec sat-03 python -m scripts.red_team  # Attack!
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # NATS Server — Inter-Satellite Link Broker
+  # --------------------------------------------------------------------------
+  nats-server:
+    image: nats:2.10-alpine
+    container_name: astraea-nats
+    ports:
+      - "4222:4222"    # Client connections
+      - "8222:8222"    # HTTP monitoring
+    command: >
+      --name astraea-nats
+      --http_port 8222
+      --max_payload 4194304
+      --write_deadline 10s
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo > /dev/tcp/localhost/4222"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # SAT-01: Standard telemetry node (low-latency link)
+  # --------------------------------------------------------------------------
+  sat-01:
+    build: .
+    container_name: astraea-sat-01
+    hostname: sat-01
+    cap_add:
+      - NET_ADMIN    # Required for tc traffic shaping
+    environment:
+      ASTRAEA_NODE_ID: "sat-01"
+      ASTRAEA_NATS_URL: "nats://nats-server:4222"
+      ASTRAEA_PEERS: "sat-02,sat-05"
+      ASTRAEA_PEER_LATENCIES: "sat-02:250,sat-05:600"
+      ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_LATENCY_MS: "200"
+      ASTRAEA_JITTER_MS: "30"
+      ASTRAEA_LOSS_PERCENT: "0"
+      ASTRAEA_BANDWIDTH: "2mbit"
+      ASTRAEA_TELEMETRY_HZ: "10"
+      ASTRAEA_FEDERATION_INTERVAL: "30"
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      nats-server:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # SAT-02: Standard telemetry node (medium-latency link)
+  # --------------------------------------------------------------------------
+  sat-02:
+    build: .
+    container_name: astraea-sat-02
+    hostname: sat-02
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ASTRAEA_NODE_ID: "sat-02"
+      ASTRAEA_NATS_URL: "nats://nats-server:4222"
+      ASTRAEA_PEERS: "sat-01,sat-03"
+      ASTRAEA_PEER_LATENCIES: "sat-01:250,sat-03:350"
+      ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_LATENCY_MS: "350"
+      ASTRAEA_JITTER_MS: "50"
+      ASTRAEA_LOSS_PERCENT: "1"
+      ASTRAEA_BANDWIDTH: "1mbit"
+      ASTRAEA_TELEMETRY_HZ: "10"
+      ASTRAEA_FEDERATION_INTERVAL: "30"
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      nats-server:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # SAT-03: The "attack target" — will receive red-team injection
+  # --------------------------------------------------------------------------
+  sat-03:
+    build: .
+    container_name: astraea-sat-03
+    hostname: sat-03
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ASTRAEA_NODE_ID: "sat-03"
+      ASTRAEA_NATS_URL: "nats://nats-server:4222"
+      ASTRAEA_PEERS: "sat-02,sat-04"
+      ASTRAEA_PEER_LATENCIES: "sat-02:350,sat-04:300"
+      ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_LATENCY_MS: "400"
+      ASTRAEA_JITTER_MS: "80"
+      ASTRAEA_LOSS_PERCENT: "2"
+      ASTRAEA_BANDWIDTH: "1mbit"
+      ASTRAEA_TELEMETRY_HZ: "10"
+      ASTRAEA_FEDERATION_INTERVAL: "30"
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      nats-server:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # SAT-04: High-latency edge node (simulates far orbital plane)
+  # --------------------------------------------------------------------------
+  sat-04:
+    build: .
+    container_name: astraea-sat-04
+    hostname: sat-04
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ASTRAEA_NODE_ID: "sat-04"
+      ASTRAEA_NATS_URL: "nats://nats-server:4222"
+      ASTRAEA_PEERS: "sat-03,sat-05"
+      ASTRAEA_PEER_LATENCIES: "sat-03:300,sat-05:400"
+      ASTRAEA_IS_AGGREGATOR: "false"
+      ASTRAEA_LATENCY_MS: "600"
+      ASTRAEA_JITTER_MS: "100"
+      ASTRAEA_LOSS_PERCENT: "3"
+      ASTRAEA_BANDWIDTH: "512kbit"
+      ASTRAEA_TELEMETRY_HZ: "10"
+      ASTRAEA_FEDERATION_INTERVAL: "30"
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.14
+    depends_on:
+      nats-server:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # SAT-05: Federation Aggregator + Grey-Hole Attack Simulation
+  # --------------------------------------------------------------------------
+  sat-05:
+    build: .
+    container_name: astraea-sat-05
+    hostname: sat-05
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ASTRAEA_NODE_ID: "sat-05"
+      ASTRAEA_NATS_URL: "nats://nats-server:4222"
+      ASTRAEA_PEERS: "sat-01,sat-04"
+      ASTRAEA_PEER_LATENCIES: "sat-01:600,sat-04:400"
+      ASTRAEA_IS_AGGREGATOR: "true"
+      ASTRAEA_LATENCY_MS: "800"
+      ASTRAEA_JITTER_MS: "120"
+      ASTRAEA_LOSS_PERCENT: "5"
+      ASTRAEA_BANDWIDTH: "512kbit"
+      ASTRAEA_TELEMETRY_HZ: "10"
+      ASTRAEA_FEDERATION_INTERVAL: "30"
+    networks:
+      constellation:
+        ipv4_address: 172.28.0.15
+    depends_on:
+      nats-server:
+        condition: service_healthy
+
+# ============================================================================
+# Network: Bridge network simulating the constellation mesh
+# ============================================================================
+networks:
+  constellation:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1

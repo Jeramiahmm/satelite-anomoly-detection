@@ -1,0 +1,110 @@
+{
+    "constellation_id": "astraea-1",
+    "trust_domain": "astraea-1.mesh",
+    "reference_standards": [
+        "NIST SP 800-207 (Zero Trust Architecture)",
+        "CCSDS 350.0-G-3 (Space Data Link Security)",
+        "RFC 5280 (X.509 PKI)"
+    ],
+    "topology": {
+        "type": "ring",
+        "nodes": [
+            {
+                "node_id": "sat-01",
+                "role": "telemetry",
+                "ip": "172.28.0.11",
+                "peers": ["sat-02", "sat-05"],
+                "orbital_params": {
+                    "latency_ms": 200,
+                    "jitter_ms": 30,
+                    "loss_percent": 0,
+                    "bandwidth": "2mbit"
+                }
+            },
+            {
+                "node_id": "sat-02",
+                "role": "telemetry",
+                "ip": "172.28.0.12",
+                "peers": ["sat-01", "sat-03"],
+                "orbital_params": {
+                    "latency_ms": 350,
+                    "jitter_ms": 50,
+                    "loss_percent": 1,
+                    "bandwidth": "1mbit"
+                }
+            },
+            {
+                "node_id": "sat-03",
+                "role": "telemetry",
+                "ip": "172.28.0.13",
+                "peers": ["sat-02", "sat-04"],
+                "orbital_params": {
+                    "latency_ms": 400,
+                    "jitter_ms": 80,
+                    "loss_percent": 2,
+                    "bandwidth": "1mbit"
+                }
+            },
+            {
+                "node_id": "sat-04",
+                "role": "telemetry",
+                "ip": "172.28.0.14",
+                "peers": ["sat-03", "sat-05"],
+                "orbital_params": {
+                    "latency_ms": 600,
+                    "jitter_ms": 100,
+                    "loss_percent": 3,
+                    "bandwidth": "512kbit"
+                }
+            },
+            {
+                "node_id": "sat-05",
+                "role": "aggregator",
+                "ip": "172.28.0.15",
+                "peers": ["sat-01", "sat-04"],
+                "orbital_params": {
+                    "latency_ms": 800,
+                    "jitter_ms": 120,
+                    "loss_percent": 5,
+                    "bandwidth": "512kbit"
+                }
+            }
+        ]
+    },
+    "security": {
+        "cert_ttl_seconds": 300,
+        "ca_ttl_days": 30,
+        "curve": "secp384r1",
+        "tls_min_version": "TLSv1.3",
+        "revocation_threshold": 0.8,
+        "isolation_threshold": 0.6,
+        "consecutive_anomalies_required": 2
+    },
+    "ml": {
+        "vae": {
+            "input_dim": 3,
+            "latent_dim": 8,
+            "features": ["voltage_v", "reaction_wheel_rpm", "snr_db"]
+        },
+        "anomaly_detection": {
+            "ema_alpha": 0.05,
+            "sigma_multiplier": 3.0,
+            "warmup_samples": 50,
+            "anomaly_ceiling": 0.8
+        },
+        "federation": {
+            "algorithm": "FedAvg",
+            "min_participants": 2,
+            "delta_clip_norm": 10.0,
+            "round_interval_s": 30,
+            "local_epochs_per_round": 5,
+            "learning_rate": 0.001,
+            "kl_weight": 0.5
+        }
+    },
+    "routing": {
+        "algorithm": "dijkstra",
+        "trust_sensitivity": 1.25,
+        "lsa_interval_s": 5.0
+    }
+}

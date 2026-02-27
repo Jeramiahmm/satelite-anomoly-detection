@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Certificates (generated at runtime)
+certs/*.pem
+certs/*.key
+certs/*.crt
+
+# PyTorch models
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
