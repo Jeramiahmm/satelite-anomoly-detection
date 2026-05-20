@@ -1,0 +1,14 @@
+# Astraea-1 Protocol — Python Dependencies
+# ==========================================
+
+# Core ML
+torch>=2.0.0
+
+# Cryptography (X.509, ECDSA, mTLS)
+cryptography>=41.0.0
+
+# Async messaging (NATS for ISL)
+nats-py>=2.6.0
+
+# Utilities
+numpy>=1.24.0
